@@ -1,12 +1,17 @@
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import bcrypt
 from jose import jwt
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from database import SessionLocal
+from models import ActivityRecordDB, HealthRecordDB, UserDB
 from typing import Optional
 
 app = FastAPI()
@@ -86,6 +91,14 @@ def save_data() -> None:
 users, records, activity_records = load_data()
 
 
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 def calculate_health_result(record: HealthRecord) -> dict:
     height_m = record.height / 100
     bmi = record.weight / (height_m * height_m)
@@ -137,6 +150,41 @@ def make_record(record_id: int, record: HealthRecord) -> dict:
         "is_deleted": False,
         **record.model_dump(),
         **calculate_health_result(record),
+    }
+
+
+def db_record_to_dict(record: HealthRecordDB) -> dict:
+    return {
+        "id": record.id,
+        "user_id": record.user_id,
+        "date": record.date.isoformat(),
+        "weight": record.weight,
+        "height": record.height,
+        "systolic": record.systolic,
+        "diastolic": record.diastolic,
+        "blood_sugar": record.blood_sugar,
+        "steps": record.steps,
+        "sleep_hours": record.sleep_hours,
+        "memo": record.memo,
+        "bmi": record.bmi,
+        "bmi_category": record.bmi_category,
+        "bp_category": record.bp_category,
+        "sugar_category": record.sugar_category,
+        "warnings": record.warnings or [],
+        "is_deleted": record.is_deleted,
+        "deleted_at": record.deleted_at.isoformat() if record.deleted_at else None,
+    }
+
+
+def db_activity_to_dict(record: ActivityRecordDB) -> dict:
+    return {
+        "id": record.id,
+        "user_id": record.user_id,
+        "measured_at": record.measured_at.isoformat(),
+        "heart_rate": record.heart_rate,
+        "steps": record.steps,
+        "active_energy": record.active_energy,
+        "workout_type": record.workout_type,
     }
 
 
@@ -212,64 +260,71 @@ def health_check():
 
 
 @app.post("/auth/signup")
-def signup(user: UserCreate):
-    if any(existing_user["email"] == user.email for existing_user in users):
+def signup(user: UserCreate, db: Session = Depends(get_db)):
+    if db.query(UserDB).filter(UserDB.email == user.email).first():
         raise HTTPException(
             status_code=409, detail="이미 가입된 이메일입니다."
         )
 
-    new_user = {
-        "id": max([item["id"] for item in users], default=0) + 1,
-        "name": user.name,
-        "email": user.email,
-        "password_hash": hash_password(user.password),
-    }
-    users.append(new_user)
-    save_data()
+    new_user = UserDB(
+        name=user.name,
+        email=user.email,
+        password_hash=hash_password(user.password),
+    )
+    try:
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="이미 가입된 이메일입니다.",
+        )
 
     return {
-        "id": new_user["id"],
-        "name": new_user["name"],
-        "email": new_user["email"],
+        "id": new_user.id,
+        "name": new_user.name,
+        "email": new_user.email,
     }
 
 
 @app.post("/auth/login")
-def login(login_request: LoginRequest):
-    user = next(
-        (item for item in users if item["email"] == login_request.email),
-        None,
-    )
+def login(login_request: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.email == login_request.email).first()
 
-    if user is None or "password_hash" not in user:
+    if user is None:
         raise HTTPException(
             status_code=401,
             detail="이메일 또는 비밀번호가 올바르지 않습니다.",
         )
 
-    if not verify_password(login_request.password, user["password_hash"]):
+    if not verify_password(login_request.password, user.password_hash):
         raise HTTPException(
             status_code=401,
             detail="이메일 또는 비밀번호가 올바르지 않습니다.",
         )
 
     return {
-        "access_token": create_access_token(user["id"]),
+        "access_token": create_access_token(user.id),
         "token_type": "bearer",
     }
 
 
 @app.get("/auth/me")
-def get_me(user_id: int = Depends(get_current_user_id)):
-    user = next((item for item in users if item["id"] == user_id), None)
+def get_me(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
 
     if user is None:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
 
     return {
-        "id": user["id"],
-        "name": user["name"],
-        "email": user["email"],
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
     }
 
 
@@ -289,39 +344,70 @@ def create_user(user: User):
 
 
 @app.get("/users")
-def get_users():
+def get_users(db: Session = Depends(get_db)):
+    db_users = db.query(UserDB).all()
+
     return {
-        "count": len(users),
-        "users": users,
+        "count": len(db_users),
+        "users": [
+            {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+            }
+            for user in db_users
+        ],
     }
 
 @app.post("/records")
 def create_record(
     record: HealthRecord,
     current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
     if record.user_id != current_user_id:
         raise HTTPException(status_code=403, detail="사용자 정보가 일치하지 않습니다.")
 
-    ensure_user_exists(current_user_id)
-    new_record = make_record(len(records) + 1, record)
+    if not db.query(UserDB).filter(UserDB.id == current_user_id).first():
+        raise HTTPException(status_code=404, detail="등록되지 않은 사용자입니다.")
 
-    records.append(new_record)
-    save_data()
+    calculated = calculate_health_result(record)
+    db_record = HealthRecordDB(
+        user_id=current_user_id,
+        date=date.fromisoformat(record.date),
+        weight=record.weight,
+        height=record.height,
+        systolic=record.systolic,
+        diastolic=record.diastolic,
+        blood_sugar=record.blood_sugar,
+        steps=record.steps,
+        sleep_hours=record.sleep_hours,
+        memo=record.memo,
+        **calculated,
+    )
+    db.add(db_record)
+    db.commit()
+    db.refresh(db_record)
 
-    return new_record
+    return db_record_to_dict(db_record)
 
 @app.get("/records")
-def get_records(current_user_id: int = Depends(get_current_user_id)):
-    visible_records = [
-        record for record in records
-        if record["user_id"] == current_user_id
-        and not record.get("is_deleted", False)
-    ]
+def get_records(
+    current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    visible_records = (
+        db.query(HealthRecordDB)
+        .filter(
+            HealthRecordDB.user_id == current_user_id,
+            HealthRecordDB.is_deleted.is_(False),
+        )
+        .all()
+    )
 
     return {
         "count": len(visible_records),
-        "records": visible_records,
+        "records": [db_record_to_dict(record) for record in visible_records],
     }
 
 
@@ -330,20 +416,24 @@ def search_records(
     start: str,
     end: str,
     current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
-    matched_records = [
-        record
-        for record in records
-        if start <= record["date"] <= end
-        and record["user_id"] == current_user_id
-        and not record.get("is_deleted", False)
-    ]
+    matched_records = (
+        db.query(HealthRecordDB)
+        .filter(
+            HealthRecordDB.user_id == current_user_id,
+            HealthRecordDB.date >= date.fromisoformat(start),
+            HealthRecordDB.date <= date.fromisoformat(end),
+            HealthRecordDB.is_deleted.is_(False),
+        )
+        .all()
+    )
 
     return {
         "count": len(matched_records),
         "start": start,
         "end": end,
-        "records": matched_records,
+        "records": [db_record_to_dict(record) for record in matched_records],
     }
 
 
@@ -352,14 +442,18 @@ def get_stats(
     start: str,
     end: str,
     current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
-    target_records = [
-        record
-        for record in records
-        if start <= record["date"] <= end
-        and record["user_id"] == current_user_id
-        and not record.get("is_deleted", False)
-    ]
+    target_records = (
+        db.query(HealthRecordDB)
+        .filter(
+            HealthRecordDB.user_id == current_user_id,
+            HealthRecordDB.date >= date.fromisoformat(start),
+            HealthRecordDB.date <= date.fromisoformat(end),
+            HealthRecordDB.is_deleted.is_(False),
+        )
+        .all()
+    )
 
     if not target_records:
         return {
@@ -371,13 +465,7 @@ def get_stats(
 
     count = len(target_records)
 
-    bmi_values = [
-        record.get(
-            "bmi",
-            round(record["weight"] / ((record["height"] / 100) ** 2), 2),
-        )
-        for record in target_records
-    ]
+    bmi_values = [record.bmi for record in target_records]
 
     return {
         "count": count,
@@ -385,20 +473,20 @@ def get_stats(
         "end": end,
         "user_id": current_user_id,
         "average_weight": round(
-            sum(record["weight"] for record in target_records) / count,
+            sum(record.weight for record in target_records) / count,
             2,
         ),
         "average_bmi": round(sum(bmi_values) / count, 2),
         "average_systolic": round(
-            sum(record["systolic"] for record in target_records) / count,
+            sum(record.systolic for record in target_records) / count,
             2,
         ),
         "average_diastolic": round(
-            sum(record["diastolic"] for record in target_records) / count,
+            sum(record.diastolic for record in target_records) / count,
             2,
         ),
         "average_blood_sugar": round(
-            sum(record["blood_sugar"] for record in target_records) / count,
+            sum(record.blood_sugar for record in target_records) / count,
             2,
         ),
     }
@@ -408,12 +496,20 @@ def get_stats(
 def get_record(
     record_id: int,
     current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
-    for record in records:
-        if record["id"] == record_id and (
-            record["user_id"] == current_user_id
-        ) and not record.get("is_deleted", False):
-            return record
+    record = (
+        db.query(HealthRecordDB)
+        .filter(
+            HealthRecordDB.id == record_id,
+            HealthRecordDB.user_id == current_user_id,
+            HealthRecordDB.is_deleted.is_(False),
+        )
+        .first()
+    )
+
+    if record is not None:
+        return db_record_to_dict(record)
 
     raise HTTPException(
         status_code=404,
@@ -425,56 +521,76 @@ def update_record(
     record_id: int,
     updated_record: HealthRecord,
     current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
     if updated_record.user_id != current_user_id:
         raise HTTPException(status_code=403, detail="사용자 정보가 일치하지 않습니다.")
 
-    for index, record in enumerate(records):
-        if record["id"] == record_id and not record.get("is_deleted", False):
-            if record["user_id"] != current_user_id:
-                raise HTTPException(
-                    status_code=403,
-                    detail="다른 사용자의 기록은 수정할 수 없습니다.",
-                )
-
-            records[index] = make_record(record_id, updated_record)
-            save_data()
-
-            return records[index]
-
-    raise HTTPException(
-        status_code=404,
-        detail="기록을 찾을 수 없습니다.",
+    db_record = (
+        db.query(HealthRecordDB)
+        .filter(
+            HealthRecordDB.id == record_id,
+            HealthRecordDB.user_id == current_user_id,
+            HealthRecordDB.is_deleted.is_(False),
+        )
+        .first()
     )
+
+    if db_record is None:
+        raise HTTPException(status_code=404, detail="기록을 찾을 수 없습니다.")
+
+    calculated = calculate_health_result(updated_record)
+    db_record.date = date.fromisoformat(updated_record.date)
+    db_record.weight = updated_record.weight
+    db_record.height = updated_record.height
+    db_record.systolic = updated_record.systolic
+    db_record.diastolic = updated_record.diastolic
+    db_record.blood_sugar = updated_record.blood_sugar
+    db_record.steps = updated_record.steps
+    db_record.sleep_hours = updated_record.sleep_hours
+    db_record.memo = updated_record.memo
+
+    for key, value in calculated.items():
+        setattr(db_record, key, value)
+
+    db.commit()
+    db.refresh(db_record)
+    return db_record_to_dict(db_record)
 
 @app.delete("/records/{record_id}")
 def delete_record(
     record_id: int,
     current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
-    for index, record in enumerate(records):
-        if record["id"] == record_id and (
-            record["user_id"] == current_user_id
-        ):
-            records[index]["is_deleted"] = True
-            records[index]["deleted_at"] = datetime.now(
-                timezone.utc
-            ).isoformat()
-            save_data()
-            return {
-                "message": "기록이 삭제되었습니다.",
-                "record": records[index],
-            }
-
-    raise HTTPException(
-        status_code=404,
-        detail="기록을 찾을 수 없습니다.",
+    db_record = (
+        db.query(HealthRecordDB)
+        .filter(
+            HealthRecordDB.id == record_id,
+            HealthRecordDB.user_id == current_user_id,
+            HealthRecordDB.is_deleted.is_(False),
+        )
+        .first()
     )
+
+    if db_record is None:
+        raise HTTPException(status_code=404, detail="기록을 찾을 수 없습니다.")
+
+    db_record.is_deleted = True
+    db_record.deleted_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(db_record)
+
+    return {
+        "message": "기록이 삭제되었습니다.",
+        "record": db_record_to_dict(db_record),
+    }
 
 @app.post("/activity-records")
 def create_activity_record(
     record: ActivityRecord,
     current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
     if record.user_id != current_user_id:
         raise HTTPException(
@@ -482,30 +598,36 @@ def create_activity_record(
             detail="사용자 정보가 일치하지 않습니다.",
         )
 
-    ensure_user_exists(current_user_id)
+    if not db.query(UserDB).filter(UserDB.id == current_user_id).first():
+        raise HTTPException(status_code=404, detail="등록되지 않은 사용자입니다.")
 
-    new_record = {
-        "id": len(activity_records) + 1,
-        **record.model_dump(),
-    }
+    db_record = ActivityRecordDB(
+        user_id=current_user_id,
+        measured_at=datetime.fromisoformat(record.measured_at),
+        heart_rate=record.heart_rate,
+        steps=record.steps,
+        active_energy=record.active_energy,
+        workout_type=record.workout_type,
+    )
+    db.add(db_record)
+    db.commit()
+    db.refresh(db_record)
 
-    activity_records.append(new_record)
-    save_data()
-
-    return new_record
+    return db_activity_to_dict(db_record)
 
 
 @app.get("/activity-records")
 def get_activity_records(
     current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
-    visible_records = [
-        record
-        for record in activity_records
-        if record["user_id"] == current_user_id
-    ]
+    visible_records = (
+        db.query(ActivityRecordDB)
+        .filter(ActivityRecordDB.user_id == current_user_id)
+        .all()
+    )
 
     return {
         "count": len(visible_records),
-        "records": visible_records,
+        "records": [db_activity_to_dict(record) for record in visible_records],
     }

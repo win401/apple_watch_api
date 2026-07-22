@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:16
+    container_name: health-postgres
+    environment:
+      POSTGRES_USER: healthuser
+      POSTGRES_PASSWORD: healthpass
+      POSTGRES_DB: healthdb
+    volumes:
+      - health-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U healthuser -d healthdb']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: health-log-api
+    environment:
+      DATABASE_URL: postgresql+psycopg2://healthuser:healthpass@db:5432/healthdb
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+    ports:
+      - '8000:8000'
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "python create_tables.py &&
+      python migrate_health_records.py &&
+      uvicorn main:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  health-postgres-data:
+    name: health-postgres-data
+    external: true

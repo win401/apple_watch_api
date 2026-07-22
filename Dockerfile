@@ -7,6 +7,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY database.py .
+COPY models.py .
+COPY create_tables.py .
+COPY migrate_health_records.py .
 COPY data.json .
 
 EXPOSE 8000
