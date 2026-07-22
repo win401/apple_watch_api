@@ -1,13 +1,21 @@
 import json
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException
+import bcrypt
+from jose import jwt
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from typing import Optional
 
 app = FastAPI()
 
 DATA_FILE = "data.json"
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+security = HTTPBearer()
 
 class HealthRecord(BaseModel):
     user_id: int
@@ -26,6 +34,17 @@ class User(BaseModel):
     id: int
     name: str
     email: str
+
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 
 class ActivityRecord(BaseModel):    
@@ -128,6 +147,61 @@ def ensure_user_exists(user_id: int) -> None:
             detail="등록되지 않은 사용자입니다.",
         )
 
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(
+        password.encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(
+        password.encode("utf-8"),
+        password_hash.encode("utf-8"),
+    )
+
+
+def create_access_token(user_id: int) -> str:
+    if not SECRET_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="JWT_SECRET_KEY 환경변수가 설정되지 않았습니다.",
+        )
+
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    payload = {"sub": str(user_id), "exp": expires_at}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user_id(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> int:
+    token = credentials.credentials
+
+    if not SECRET_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="JWT_SECRET_KEY 환경변수가 설정되지 않았습니다.",
+        )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+
+        if user_id is None:
+            raise ValueError
+
+        return int(user_id)
+    except (ValueError, TypeError, jwt.JWTError):
+        raise HTTPException(
+            status_code=401,
+            detail="유효하지 않은 인증 토큰입니다.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
 @app.get("/")
 def home():
     return {"message": "헬스 로그 API 서버가 실행 중입니다."}
@@ -135,6 +209,68 @@ def home():
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.post("/auth/signup")
+def signup(user: UserCreate):
+    if any(existing_user["email"] == user.email for existing_user in users):
+        raise HTTPException(
+            status_code=409, detail="이미 가입된 이메일입니다."
+        )
+
+    new_user = {
+        "id": max([item["id"] for item in users], default=0) + 1,
+        "name": user.name,
+        "email": user.email,
+        "password_hash": hash_password(user.password),
+    }
+    users.append(new_user)
+    save_data()
+
+    return {
+        "id": new_user["id"],
+        "name": new_user["name"],
+        "email": new_user["email"],
+    }
+
+
+@app.post("/auth/login")
+def login(login_request: LoginRequest):
+    user = next(
+        (item for item in users if item["email"] == login_request.email),
+        None,
+    )
+
+    if user is None or "password_hash" not in user:
+        raise HTTPException(
+            status_code=401,
+            detail="이메일 또는 비밀번호가 올바르지 않습니다.",
+        )
+
+    if not verify_password(login_request.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=401,
+            detail="이메일 또는 비밀번호가 올바르지 않습니다.",
+        )
+
+    return {
+        "access_token": create_access_token(user["id"]),
+        "token_type": "bearer",
+    }
+
+
+@app.get("/auth/me")
+def get_me(user_id: int = Depends(get_current_user_id)):
+    user = next((item for item in users if item["id"] == user_id), None)
+
+    if user is None:
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+
+    return {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+    }
 
 
 @app.post("/users")
@@ -160,8 +296,14 @@ def get_users():
     }
 
 @app.post("/records")
-def create_record(record: HealthRecord):
-    ensure_user_exists(record.user_id)
+def create_record(
+    record: HealthRecord,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    if record.user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="사용자 정보가 일치하지 않습니다.")
+
+    ensure_user_exists(current_user_id)
     new_record = make_record(len(records) + 1, record)
 
     records.append(new_record)
@@ -170,15 +312,12 @@ def create_record(record: HealthRecord):
     return new_record
 
 @app.get("/records")
-def get_records(user_id: Optional[int] = None):
+def get_records(current_user_id: int = Depends(get_current_user_id)):
     visible_records = [
-        record for record in records if not record.get("is_deleted", False)
+        record for record in records
+        if record["user_id"] == current_user_id
+        and not record.get("is_deleted", False)
     ]
-
-    if user_id is not None:
-        visible_records = [
-            record for record in records if record["user_id"] == user_id
-        ]
 
     return {
         "count": len(visible_records),
@@ -190,13 +329,13 @@ def get_records(user_id: Optional[int] = None):
 def search_records(
     start: str,
     end: str,
-    user_id: Optional[int] = None,
+    current_user_id: int = Depends(get_current_user_id),
 ):
     matched_records = [
         record
         for record in records
         if start <= record["date"] <= end
-        and (user_id is None or record["user_id"] == user_id)
+        and record["user_id"] == current_user_id
         and not record.get("is_deleted", False)
     ]
 
@@ -212,13 +351,13 @@ def search_records(
 def get_stats(
     start: str,
     end: str,
-    user_id: Optional[int] = None,
+    current_user_id: int = Depends(get_current_user_id),
 ):
     target_records = [
         record
         for record in records
         if start <= record["date"] <= end
-        and (user_id is None or record["user_id"] == user_id)
+        and record["user_id"] == current_user_id
         and not record.get("is_deleted", False)
     ]
 
@@ -244,7 +383,7 @@ def get_stats(
         "count": count,
         "start": start,
         "end": end,
-        "user_id": user_id,
+        "user_id": current_user_id,
         "average_weight": round(
             sum(record["weight"] for record in target_records) / count,
             2,
@@ -266,10 +405,13 @@ def get_stats(
 
 
 @app.get("/records/{record_id}")
-def get_record(record_id: int, user_id: Optional[int] = None):
+def get_record(
+    record_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+):
     for record in records:
         if record["id"] == record_id and (
-            user_id is None or record["user_id"] == user_id
+            record["user_id"] == current_user_id
         ) and not record.get("is_deleted", False):
             return record
 
@@ -279,10 +421,17 @@ def get_record(record_id: int, user_id: Optional[int] = None):
     )
 
 @app.put("/records/{record_id}")
-def update_record(record_id: int, updated_record: HealthRecord):
+def update_record(
+    record_id: int,
+    updated_record: HealthRecord,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    if updated_record.user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="사용자 정보가 일치하지 않습니다.")
+
     for index, record in enumerate(records):
         if record["id"] == record_id and not record.get("is_deleted", False):
-            if record["user_id"] != updated_record.user_id:
+            if record["user_id"] != current_user_id:
                 raise HTTPException(
                     status_code=403,
                     detail="다른 사용자의 기록은 수정할 수 없습니다.",
@@ -299,10 +448,13 @@ def update_record(record_id: int, updated_record: HealthRecord):
     )
 
 @app.delete("/records/{record_id}")
-def delete_record(record_id: int, user_id: Optional[int] = None):
+def delete_record(
+    record_id: int,
+    current_user_id: int = Depends(get_current_user_id),
+):
     for index, record in enumerate(records):
         if record["id"] == record_id and (
-            user_id is None or record["user_id"] == user_id
+            record["user_id"] == current_user_id
         ):
             records[index]["is_deleted"] = True
             records[index]["deleted_at"] = datetime.now(
@@ -320,7 +472,18 @@ def delete_record(record_id: int, user_id: Optional[int] = None):
     )
 
 @app.post("/activity-records")
-def create_activity_record(record: ActivityRecord):
+def create_activity_record(
+    record: ActivityRecord,
+    current_user_id: int = Depends(get_current_user_id),
+):
+    if record.user_id != current_user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="사용자 정보가 일치하지 않습니다.",
+        )
+
+    ensure_user_exists(current_user_id)
+
     new_record = {
         "id": len(activity_records) + 1,
         **record.model_dump(),
@@ -333,15 +496,14 @@ def create_activity_record(record: ActivityRecord):
 
 
 @app.get("/activity-records")
-def get_activity_records(user_id: Optional[int] = None):
-    visible_records = activity_records
-
-    if user_id is not None:
-        visible_records = [
-            record
-            for record in activity_records
-            if record["user_id"] == user_id
-        ]
+def get_activity_records(
+    current_user_id: int = Depends(get_current_user_id),
+):
+    visible_records = [
+        record
+        for record in activity_records
+        if record["user_id"] == current_user_id
+    ]
 
     return {
         "count": len(visible_records),
