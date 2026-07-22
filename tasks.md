@@ -46,10 +46,29 @@
 - [ ] 건강 기록과 사용자 관계 검증
 - [ ] 활동 기록과 사용자 관계 검증
 - [ ] 사용자 인증 방식 결정
+- [ ] 비밀번호 해싱 방식 결정
 - [ ] JWT 로그인 인증 추가
+- [ ] JWT 토큰에서 현재 사용자 식별
+- [ ] 인증된 사용자만 본인 기록 조회·수정·삭제
 - [ ] 소프트 삭제 필드(`is_deleted`, `deleted_at`) 설계
 - [ ] 삭제된 기록을 일반 조회·검색·통계에서 제외
 - [ ] 필요 시 관리자용 실제 삭제 기능 추가
+
+## 데이터베이스 전환 - PostgreSQL
+
+- [ ] PostgreSQL 로컬 또는 Docker 환경 준비
+- [ ] PostgreSQL 연결 설정을 환경변수로 분리
+- [ ] SQLAlchemy 또는 SQLModel 선택
+- [ ] `users` 테이블 설계
+- [ ] `health_records` 테이블 설계
+- [ ] `activity_records` 테이블 설계
+- [ ] 사용자와 건강 기록의 외래키 관계 설정
+- [ ] JSON 파일 데이터를 PostgreSQL로 이전
+- [ ] CRUD를 PostgreSQL 기반으로 전환
+- [ ] 통계·검색을 PostgreSQL 쿼리로 전환
+- [ ] 소프트 삭제를 DB 컬럼으로 관리
+- [ ] Docker Compose로 API + PostgreSQL 실행
+- [ ] AWS 배포 환경에 PostgreSQL 연결
 
 ## 과제 4 - Docker·배포
 
@@ -68,14 +87,16 @@
 ## 배포 후 보완
 
 - [ ] Docker 볼륨으로 `data.json` 영구 보존
+- [ ] PostgreSQL 데이터 볼륨 영구 보존
 - [ ] AWS 보안 그룹·방화벽 점검
 - [ ] HTTPS 및 도메인 연결 검토
 - [ ] AWS 배포 URL README 최신화
 
 ## 확장 목표 - Apple Watch 연동
 
-- [ ] SwiftUI 앱 생성
+- [ ] SwiftUI iPhone 앱 생성
 - [ ] HealthKit 권한 요청
 - [ ] 걸음 수 또는 심박수 조회
-- [ ] FastAPI 서버로 데이터 전송
+- [ ] JWT 로그인 및 토큰 저장
+- [ ] 인증 토큰과 함께 FastAPI 서버로 데이터 전송
 - [ ] 실제 Apple Watch 설치 테스트
