@@ -6,7 +6,7 @@ import bcrypt
 from jose import jwt
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,16 +23,22 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 security = HTTPBearer()
 
 class HealthRecord(BaseModel):
-    user_id: int
+    user_id: int = Field(gt=0)
     date: str
-    weight: float
-    height: float
-    systolic: int
-    diastolic: int
-    blood_sugar: int
-    steps: Optional[int] = None
-    sleep_hours: Optional[float] = None
+    weight: float = Field(gt=0, le=500)
+    height: float = Field(gt=0, le=300)
+    systolic: int = Field(ge=0, le=300)
+    diastolic: int = Field(ge=0, le=200)
+    blood_sugar: int = Field(ge=0, le=1000)
+    steps: Optional[int] = Field(default=None, ge=0)
+    sleep_hours: Optional[float] = Field(default=None, ge=0, le=24)
     memo: Optional[str] = None
+
+    @field_validator("date")
+    @classmethod
+    def validate_date(cls, value: str) -> str:
+        date.fromisoformat(value)
+        return value
 
 
 class User(BaseModel):
@@ -53,12 +59,18 @@ class LoginRequest(BaseModel):
 
 
 class ActivityRecord(BaseModel):    
-    user_id: int
+    user_id: int = Field(gt=0)
     measured_at: str
-    heart_rate: float
-    steps: Optional[int] = None
-    active_energy: Optional[float] = None
+    heart_rate: float = Field(gt=0, le=250)
+    steps: Optional[int] = Field(default=None, ge=0)
+    active_energy: Optional[float] = Field(default=None, ge=0)
     workout_type: Optional[str] = None
+
+    @field_validator("measured_at")
+    @classmethod
+    def validate_measured_at(cls, value: str) -> str:
+        datetime.fromisoformat(value)
+        return value
 
 
 def load_data() -> tuple[list, list, list]:
@@ -630,4 +642,103 @@ def get_activity_records(
     return {
         "count": len(visible_records),
         "records": [db_activity_to_dict(record) for record in visible_records],
+    }
+
+
+@app.get("/activity-records/summary")
+def get_activity_summary(
+    start: str,
+    end: str,
+    current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    start_at = datetime.combine(date.fromisoformat(start), datetime.min.time())
+    end_at = datetime.combine(date.fromisoformat(end), datetime.max.time())
+
+    activity_items = (
+        db.query(ActivityRecordDB)
+        .filter(
+            ActivityRecordDB.user_id == current_user_id,
+            ActivityRecordDB.measured_at >= start_at,
+            ActivityRecordDB.measured_at <= end_at,
+        )
+        .all()
+    )
+
+    if not activity_items:
+        return {
+            "start": start,
+            "end": end,
+            "count": 0,
+            "message": "해당 기간에 활동 기록이 없습니다.",
+        }
+
+    heart_rates = [item.heart_rate for item in activity_items]
+    total_steps = sum(item.steps or 0 for item in activity_items)
+    total_energy = sum(item.active_energy or 0 for item in activity_items)
+
+    return {
+        "start": start,
+        "end": end,
+        "count": len(activity_items),
+        "average_heart_rate": round(sum(heart_rates) / len(heart_rates), 2),
+        "max_heart_rate": max(heart_rates),
+        "total_steps": total_steps,
+        "total_active_energy": round(total_energy, 2),
+    }
+
+
+@app.get("/activity-records/daily-summary")
+def get_daily_activity_summary(
+    start: str,
+    end: str,
+    current_user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    start_at = datetime.combine(date.fromisoformat(start), datetime.min.time())
+    end_at = datetime.combine(date.fromisoformat(end), datetime.max.time())
+
+    activity_items = (
+        db.query(ActivityRecordDB)
+        .filter(
+            ActivityRecordDB.user_id == current_user_id,
+            ActivityRecordDB.measured_at >= start_at,
+            ActivityRecordDB.measured_at <= end_at,
+        )
+        .all()
+    )
+
+    grouped = {}
+
+    for item in activity_items:
+        day = item.measured_at.date().isoformat()
+        grouped.setdefault(day, []).append(item)
+
+    daily_results = []
+
+    for day, items in sorted(grouped.items()):
+        heart_rates = [item.heart_rate for item in items]
+
+        daily_results.append(
+            {
+                "date": day,
+                "record_count": len(items),
+                "average_heart_rate": round(
+                    sum(heart_rates) / len(heart_rates),
+                    2,
+                ),
+                "max_heart_rate": max(heart_rates),
+                "total_steps": sum(item.steps or 0 for item in items),
+                "total_active_energy": round(
+                    sum(item.active_energy or 0 for item in items),
+                    2,
+                ),
+            }
+        )
+
+    return {
+        "start": start,
+        "end": end,
+        "count": len(daily_results),
+        "daily": daily_results,
     }
