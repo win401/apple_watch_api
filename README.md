@@ -14,7 +14,7 @@ FastAPI와 Docker로 만든 헬스 로그 REST API입니다.
 - 날짜 범위 검색
 - 평균 체중·BMI·혈압·혈당 통계
 - Apple Watch 활동 기록용 심박수·걸음 수 API
-- `data.json` 파일 저장 및 서버 재시작 후 복원
+- PostgreSQL 기반 데이터 저장
 
 ## 기술 스택
 
@@ -22,7 +22,11 @@ FastAPI와 Docker로 만든 헬스 로그 REST API입니다.
 - FastAPI
 - Uvicorn
 - Pydantic
+- SQLAlchemy
+- PostgreSQL 16
+- JWT / bcrypt
 - Docker
+- Docker Compose
 - AWS Lightsail
 
 ## 로컬 실행
@@ -89,9 +93,9 @@ AWS Lightsail Ubuntu 서버에서 다음 순서로 실행합니다.
 ```bash
 git clone https://github.com/win401/apple_watch_api.git
 cd apple_watch_api
-echo '{"health_records": [], "activity_records": []}' > data.json
-docker build -t health-log-api:1.0 .
-docker run -d --name health-log-api -p 8000:8000 --restart unless-stopped health-log-api:1.0
+export JWT_SECRET_KEY="긴 랜덤 비밀키"
+docker volume create health-postgres-data
+docker compose up --build -d
 ```
 
 Lightsail 방화벽에서 TCP `8000` 포트를 허용한 뒤 다음 주소로 접속합니다.
@@ -103,12 +107,12 @@ http://공인IP:8000/docs
 배포 접속 URL:
 
 ```text
-http://43.202.64.223:8000/docs
+http://15.165.65.176:8000/docs
 ```
 
 ## 데이터 주의사항
 
-`data.json`은 개인 건강 정보가 저장될 수 있으므로 Git에 커밋하지 않습니다. 현재는 파일 기반 저장이며, 실제 서비스에서는 SQLite나 PostgreSQL과 Docker 볼륨 사용을 권장합니다.
+PostgreSQL 데이터는 Docker volume `health-postgres-data`에 저장합니다. 비밀번호와 JWT 비밀키는 코드에 넣지 않고 환경변수로 관리해야 합니다.
 
 ## 향후 확장
 
